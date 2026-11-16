@@ -1404,13 +1404,17 @@ def _authentic_match(needle: dict, candidate: dict) -> bool:
     c_title = _strip_version(candidate.get("title") or "")
     c_artist = str(candidate.get("artist") or "").strip().casefold()
     c_dur = float(candidate.get("duration_s") or 0)
-    if not n_title or not n_artist or not c_title:
+    if not n_title or not c_title:
         return False
     if n_title.casefold() != c_title.casefold():
         return False
-    # 歌手：候选需包含网易歌手（原唱基准）；双向包含允许 "a/b" 合唱歌手
-    if n_artist not in c_artist and c_artist not in n_artist:
-        return False
+    # 网易曲目是原唱（title/artist 无翻唱标记）且候选含网易歌手 → 精确匹配
+    if _is_authentic_candidate(needle) and n_artist:
+        if n_artist not in c_artist and c_artist not in n_artist:
+            # 网易原唱但候选无网易歌手：可能是翻唱/其他歌手，需时长+非翻唱判定
+            if not (n_dur > 0 and c_dur > 0 and abs(n_dur - c_dur) <= 60.0):
+                return False
+    # 网易曲目可能翻唱（artist=翻唱者）：title 匹配即可（由阶段2 exclude_artist 排除翻唱者）
     if n_dur > 0 and c_dur > 0 and abs(n_dur - c_dur) > 60.0:
         return False
     return _is_authentic_candidate(candidate)
@@ -1421,7 +1425,11 @@ async def _netease_authentic_candidates(
 ) -> list[str]:
     """网易曲目 → 搜 musicdl + lx → 正版候选 guid（优先播放）。
 
-    返回 dl/lx 正版候选的 guid 列表（按匹配顺序）；空 = 无正版，回网易源。
+    两阶段搜索（用户需求：网易歌单翻唱 → 本地原版 → dl/lx 原版）：
+      阶段1：搜 title+artist（网易原曲目元数据）。
+      若候选含网易歌手（翻唱者，如王贰浪）→ 网易曲目是翻唱 → 阶段2：
+      搜 title（去歌手名），排除翻唱者/翻唱标记 → 原唱（如阿桑）。
+    返回 dl/lx 原唱候选 guid（按匹配顺序）；空 = 无原唱，回网易源。
     任何异常/未启用音源都返回空（不阻断网易播放）。
     """
     if not (CONF.get("musicdl_enabled") or CONF.get("lx_enabled")):
@@ -1430,22 +1438,43 @@ async def _netease_authentic_candidates(
     if not item:
         item = (_lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid) or {})
     if not item:
+        # 网易歌单曲目首次播放：从网易 API 实时拿元数据（song_id → title/artist/duration）
+        try:
+            sid = str(song_id_from_online_guid(guid) or "").split(":")[-1]
+            if sid:
+                r = await get_musicbox_client(request.app).get(
+                    f"/api/v1/songs/detail", params={"ids": sid})
+                if r.status_code == 200:
+                    data = (r.json() or {}).get("data") or []
+                    if data:
+                        d = data[0]
+                        item = {
+                            "title": d.get("name") or "",
+                            "artist": d.get("artist") or "",
+                            "duration_s": (d.get("duration_ms") or 0) / 1000.0,
+                        }
+        except Exception:  # noqa: BLE001
+            item = {}
+    if not item:
         return []
     title, artist, _album = _tag_fields(item)
     if not title:
         return []
-    # 网易曲目若是翻唱（元数据带标记），用去标记歌名重搜，避免匹配翻唱
-    if not _is_authentic_candidate(item):
-        title = _strip_version(title)
-    keyword = f"{title} {artist}".strip()
+    logger.warning("AUTHENTIC-DEBUG: guid=%s item_title=%r item_artist=%r", guid, title, artist)
     out: list[str] = []
     seen: set[str] = set()
     _dur_map: dict[str, float] = {}
+    n_artist_cf = str(artist or "").strip().casefold()
 
-    async def _collect(cands: list[dict]) -> None:
+    async def _collect(cands: list[dict], exclude_artist: str = "") -> None:
         for c in cands or []:
             if not isinstance(c, dict) or not _authentic_match(item, c):
                 continue
+            # 阶段2：排除网易翻唱者（如王贰浪）——候选歌手含翻唱者则跳过
+            if exclude_artist:
+                c_artist_cf = str(c.get("artist") or "").casefold()
+                if exclude_artist in c_artist_cf:
+                    continue
             g = online_guid_from_item(c)
             if g and g not in seen and _source_enabled(g):
                 seen.add(g)
@@ -1455,23 +1484,45 @@ async def _netease_authentic_candidates(
                 except (TypeError, ValueError):
                     _dur_map[g] = 0.0
 
-    try:
-        token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
+    async def _search(keyword: str, exclude_artist: str = "") -> bool:
+        """返回阶段内是否候选含网易歌手（翻唱检测）。"""
+        hit_netease_artist = False
         try:
-            if CONF.get("musicdl_enabled"):
-                r = await fetch_musicdl_search(
-                    get_musicdl_client(request.app), keyword, int(CONF.get("online_limit") or 20))
-                if isinstance(r, dict):
-                    await _collect(r.get("items") or [])
-            if CONF.get("lx_enabled"):
-                r = await fetch_lx_search(
-                    get_lx_client(request.app), keyword, int(CONF.get("lx_search_limit") or 20))
-                if isinstance(r, list):
-                    await _collect(r)
-        finally:
-            _FETCH_SCOPE.reset(token)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("netease authentic candidates failed: %s", type(exc).__name__)
+            token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
+            try:
+                if CONF.get("musicdl_enabled"):
+                    r = await fetch_musicdl_search(
+                        get_musicdl_client(request.app), keyword, int(CONF.get("online_limit") or 20))
+                    if isinstance(r, dict):
+                        items = r.get("items") or []
+                        if not exclude_artist and n_artist_cf and any(
+                            n_artist_cf in str(c.get("artist") or "").casefold()
+                            for c in items if isinstance(c, dict)):
+                            hit_netease_artist = True
+                        await _collect(items, exclude_artist)
+                if CONF.get("lx_enabled"):
+                    r = await fetch_lx_search(
+                        get_lx_client(request.app), keyword, int(CONF.get("lx_search_limit") or 20))
+                    if isinstance(r, list):
+                        if not exclude_artist and n_artist_cf and any(
+                            n_artist_cf in str(c.get("artist") or "").casefold()
+                            for c in r if isinstance(c, dict)):
+                            hit_netease_artist = True
+                        await _collect(r, exclude_artist)
+            finally:
+                _FETCH_SCOPE.reset(token)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("netease authentic search failed %s: %s", keyword, type(exc).__name__)
+        return hit_netease_artist
+
+    # 阶段1：搜 title+artist（网易原曲目）——若候选含网易歌手（翻唱）→ 阶段2 找原唱
+    hit = await _search(f"{title} {artist}".strip())
+    if hit:
+        # 网易曲目是翻唱：阶段2 只按 title 搜，排除翻唱者
+        await _search(_strip_version(title), n_artist_cf)
+    # 兜底：阶段1 无候选且网易曲目标记翻唱 → 阶段2 也搜
+    if not out and not _is_authentic_candidate(item):
+        await _search(_strip_version(title), n_artist_cf)
 
     # 最接近网易曲目时长（原唱基准）的正版优先播放（fetch 完成后排序）
     try:
@@ -1481,7 +1532,6 @@ async def _netease_authentic_candidates(
     except Exception:  # noqa: BLE001
         pass
     return out
-
 
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
     """Keep the published representative and strict recording alternatives."""
