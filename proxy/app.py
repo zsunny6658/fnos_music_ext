@@ -1365,6 +1365,124 @@ def _same_recording(left: dict, right: dict) -> bool:
         return False
 
 
+# ---- 网易歌单曲目 → dl/lx 正版（非翻唱）匹配 ----
+# 用户需求：网易账号歌单/推荐里的网易曲目，播放时优先用 musicdl/洛雪找
+# 正版原唱（同歌名+同歌手+时长接近，且排除翻唱/cover/remix/Live/伴奏等）。
+# 网易曲目元数据（title/artist）通常是原唱，但网易播放源可能是翻唱/版权受限，
+# 所以用元数据做"原唱基准"，在 dl/lx 搜索结果里挑正版，找不到才回网易源。
+_AUTHENTIC_NEGATIVE_MARKERS = (
+    "翻唱", "cover", "remix", "live", "伴奏", "instrumental",
+    "合唱", "片段", "试听", "现场", "acoustic", "demo",
+)
+
+
+def _strip_version(text: str) -> str:
+    """去掉标题里的版本/备注后缀（如 （翻唱）/ (Live) 等），保留核心歌名。"""
+    t = re.sub(r"[\u3000 ]*[（(][^)）]{0,12}[)）]", "", str(text or ""))
+    return t.strip()
+
+
+def _is_authentic_candidate(item: dict) -> bool:
+    """候选正版判定：title/artist/version 不含翻唱/cover/remix 等标记。"""
+    text = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("artist") or ""),
+        str(item.get("version") or ""),
+    ]).lower()
+    return not any(m in text for m in _AUTHENTIC_NEGATIVE_MARKERS)
+
+
+def _authentic_match(needle: dict, candidate: dict) -> bool:
+    """网易曲目(needle) vs dl/lx 候选(candidate)：同歌名+同歌手+时长接近，候选正版。
+
+    artist 匹配放宽：网易 '周杰伦' 与候选 '周杰伦/陈奕迅' 这种含含关系算匹配，
+    但候选必须不含翻唱/cover 标记。
+    """
+    n_title = _strip_version(needle.get("title") or "")
+    n_artist = str(needle.get("artist") or "").strip().casefold()
+    n_dur = float(needle.get("duration_s") or 0)
+    c_title = _strip_version(candidate.get("title") or "")
+    c_artist = str(candidate.get("artist") or "").strip().casefold()
+    c_dur = float(candidate.get("duration_s") or 0)
+    if not n_title or not n_artist or not c_title:
+        return False
+    if n_title.casefold() != c_title.casefold():
+        return False
+    # 歌手：候选需包含网易歌手（原唱基准）；双向包含允许 "a/b" 合唱歌手
+    if n_artist not in c_artist and c_artist not in n_artist:
+        return False
+    if n_dur > 0 and c_dur > 0 and abs(n_dur - c_dur) > 60.0:
+        return False
+    return _is_authentic_candidate(candidate)
+
+
+async def _netease_authentic_candidates(
+    request: Request, guid: str, item: dict | None
+) -> list[str]:
+    """网易曲目 → 搜 musicdl + lx → 正版候选 guid（优先播放）。
+
+    返回 dl/lx 正版候选的 guid 列表（按匹配顺序）；空 = 无正版，回网易源。
+    任何异常/未启用音源都返回空（不阻断网易播放）。
+    """
+    if not (CONF.get("musicdl_enabled") or CONF.get("lx_enabled")):
+        return []
+    # item 可能为空（网易歌单曲目不在搜索缓存，在推荐/网易歌单缓存）
+    if not item:
+        item = (_lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid) or {})
+    if not item:
+        return []
+    title, artist, _album = _tag_fields(item)
+    if not title:
+        return []
+    # 网易曲目若是翻唱（元数据带标记），用去标记歌名重搜，避免匹配翻唱
+    if not _is_authentic_candidate(item):
+        title = _strip_version(title)
+    keyword = f"{title} {artist}".strip()
+    out: list[str] = []
+    seen: set[str] = set()
+    _dur_map: dict[str, float] = {}
+
+    async def _collect(cands: list[dict]) -> None:
+        for c in cands or []:
+            if not isinstance(c, dict) or not _authentic_match(item, c):
+                continue
+            g = online_guid_from_item(c)
+            if g and g not in seen and _source_enabled(g):
+                seen.add(g)
+                out.append(g)
+                try:
+                    _dur_map[g] = float(c.get("duration_s") or 0)
+                except (TypeError, ValueError):
+                    _dur_map[g] = 0.0
+
+    try:
+        token = _FETCH_SCOPE.set(_credential_scope(request) + ":play")
+        try:
+            if CONF.get("musicdl_enabled"):
+                r = await fetch_musicdl_search(
+                    get_musicdl_client(request.app), keyword, int(CONF.get("online_limit") or 20))
+                if isinstance(r, dict):
+                    await _collect(r.get("items") or [])
+            if CONF.get("lx_enabled"):
+                r = await fetch_lx_search(
+                    get_lx_client(request.app), keyword, int(CONF.get("lx_search_limit") or 20))
+                if isinstance(r, list):
+                    await _collect(r)
+        finally:
+            _FETCH_SCOPE.reset(token)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("netease authentic candidates failed: %s", type(exc).__name__)
+
+    # 最接近网易曲目时长（原唱基准）的正版优先播放（fetch 完成后排序）
+    try:
+        needle_dur = float(item.get("duration_s") or 0)
+        if needle_dur > 0:
+            out.sort(key=lambda g: abs(_dur_map.get(g, 0.0) - needle_dur))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def deduplicate_online_items(items: list[dict]) -> list[dict]:
     """Keep the published representative and strict recording alternatives."""
     result: list[dict] = []
@@ -9472,6 +9590,13 @@ async def stream_track(request: Request, subpath: str = ""):
         return direct
     item, entry = _retained_track(request, guid)
     candidates = [guid]
+    # 网易曲目（含网易账号歌单/推荐里的网易曲目）→ 优先 dl/lx 正版（非翻唱）
+    # 用户需求：网易播放源可能是翻唱/版权受限，用元数据搜 dl/lx 找原唱正版。
+    if source_from_online_guid(guid) == "netease":
+        authentic = await _netease_authentic_candidates(request, guid, item)
+        if authentic:
+            candidates = authentic + candidates
+            fn_diag(logger, "netease_authentic_priority", guid=guid, candidates=len(authentic))
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
