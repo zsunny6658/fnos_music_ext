@@ -8100,10 +8100,23 @@ def _register_full_fetch(request: Request, guid: str) -> None:
 
 
 async def _strict_direct_play_auth(request: Request) -> bool:
-    """Fail closed before exposing any external temporary URL."""
+    """Fail closed before exposing any external temporary URL.
+
+    优化 3：若请求无 token header，自动注入 env 配置的飞牛 token
+    （FNMUSIC_MUSIC_TOKEN），使网易曲目 direct 兜底无需客户端带 token。
+    """
     if not any(request.headers.get(key) for key in (
             "cookie", "authorization", "x-trim-music-temp-token", "authx")):
-        return False
+        env_token = os.environ.get("FNMUSIC_MUSIC_TOKEN", "").strip()
+        if not env_token:
+            return False
+        # 注入 env token（Authorization: <裸token>，与飞牛 App 一致）
+        scope = dict(request.scope)
+        headers = [list(h) for h in scope.get("headers", [])]
+        headers = [h for h in headers if h[0].lower() != b"authorization"]
+        headers.append([b"authorization", env_token.encode("utf-8")])
+        scope["headers"] = headers
+        request = Request(scope)
     try:
         probe = get_upstream_client(request.app).build_request(
             "GET", "/music/api/v1/user/me", headers=copy_incoming_headers(request))
