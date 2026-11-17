@@ -8001,13 +8001,15 @@ _FULL_FETCH_MAX_CONCURRENT = 3
 _FULL_FETCH_SEM = asyncio.Semaphore(_FULL_FETCH_MAX_CONCURRENT)
 
 async def _bounded_full_fetch(guid: str, cred_headers: dict,
-                              direct_target: "DirectMediaTarget | None" = None) -> None:
+                              direct_target: "DirectMediaTarget | None" = None,
+                              purpose: str = "download") -> None:
     """信号量限并发版整轨下载（排队等待，不占满带宽）。"""
     async with _FULL_FETCH_SEM:
         if direct_target is not None:
-            await _full_fetch_download(guid, cred_headers, direct_target=direct_target)
+            await _full_fetch_download(guid, cred_headers, direct_target=direct_target,
+                                       purpose=purpose)
         else:
-            await _full_fetch_download(guid, cred_headers)
+            await _full_fetch_download(guid, cred_headers, purpose=purpose)
 
 
 
@@ -8583,13 +8585,16 @@ async def _open_direct_save(request: Request, guid: str, target: DirectMediaTarg
 
 
 async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = False,
-                               fresh_url: bool = False, direct_target: DirectMediaTarget | None = None) -> None:
+                               fresh_url: bool = False, direct_target: DirectMediaTarget | None = None,
+                               purpose: str = "download") -> None:
     """后台整轨下载 online guid 并落盘（独立于客户端连接，不占播放路径预算）。
 
     无损档解码校验失败时按 guid 拉黑并自动以 mp3 档重试一次（服务端
     quality=mp3），两次都坏才宣告失败——坏字节绝不入库。
     fresh_url：解析直链时旁路 lxmusic 成功缓存（续传回退/坏流重试等确认旧链
-    不可信的路径使用，force_mp3 重试同样强制刷新）。"""
+    不可信的路径使用，force_mp3 重试同样强制刷新）。
+    优化 10：purpose 默认 download——网易曲目整轨走 _resolve_netease_download_media
+    （download 路径拿整轨直链），而非 playback 路径（resolve_netease_url）。"""
     part = None
     resp = None
     owned = None
@@ -8601,7 +8606,7 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
             opened = await _open_direct_save(fake_request, guid, direct_target)
         else:
             opened = await _open_online_stream(fake_request, guid, None, force_mp3=force_mp3,
-                                               fresh_url=fresh_url or force_mp3)
+                                               fresh_url=fresh_url or force_mp3, purpose=purpose)
         if not opened:
             raise RuntimeError("open failed")
         resp, owned, ext, info, chunks, first = opened
@@ -8645,7 +8650,8 @@ async def _full_fetch_download(guid: str, cred_headers: dict, force_mp3: bool = 
                     resp = owned = None
                 if direct_target is None and not force_mp3 and reason == "decode_error":
                     logger.warning("retrying %s with mp3 tier after corrupt lossless stream", guid)
-                    await _full_fetch_download(guid, cred_headers, force_mp3=True, fresh_url=True)
+                    await _full_fetch_download(guid, cred_headers, force_mp3=True, fresh_url=True,
+                                               purpose=purpose)
                     return
                 if reason in ("timeout", "exec_error"):
                     # 两次校验仍无定论：完整字节不销毁（遗留 .part 交由垃圾清理），
