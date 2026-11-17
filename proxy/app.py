@@ -1438,6 +1438,34 @@ _NETEASE_CAND_META: dict[str, tuple] = {}
 # 优化 8（加载速度）：网易曲目搜索结果缓存（guid → (时间戳, 候选列表)），TTL 内不重复搜 musicdl
 _NETEASE_CAND_CACHE: dict[str, tuple] = {}
 _NETEASE_CAND_CACHE_TTL_S = 1800.0
+_NETEASE_CAND_CACHE_MAX = 200  # 稳定性：LRU 上限，防长期运行内存膨胀
+
+
+def _netease_cand_cache_prune() -> None:
+    """稳定性：超上限/过期条目清理（LRU）。"""
+    try:
+        now = time.monotonic()
+        if len(_NETEASE_CAND_CACHE) > _NETEASE_CAND_CACHE_MAX:
+            # 按时间戳升序，删除最旧（超出上限部分 + 过期）
+            expired = [g for g, (ts, _) in _NETEASE_CAND_CACHE.items()
+                       if now - ts >= _NETEASE_CAND_CACHE_TTL_S]
+            for g in expired:
+                _NETEASE_CAND_CACHE.pop(g, None)
+            # 仍超上限：删最旧
+            while len(_NETEASE_CAND_CACHE) > _NETEASE_CAND_CACHE_MAX:
+                try:
+                    oldest = min(_NETEASE_CAND_CACHE, key=lambda g: _NETEASE_CAND_CACHE[g][0])
+                    _NETEASE_CAND_CACHE.pop(oldest, None)
+                except Exception:  # noqa: BLE001
+                    break
+        if len(_NETEASE_CAND_META) > _NETEASE_CAND_CACHE_MAX * 2:
+            # 元数据缓存同源清理（guid 不在搜索缓存则删）
+            keep = set(_NETEASE_CAND_CACHE)
+            for g in list(_NETEASE_CAND_META):
+                if g not in keep:
+                    _NETEASE_CAND_META.pop(g, None)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def _netease_authentic_candidates(
@@ -1566,6 +1594,7 @@ async def _netease_authentic_candidates(
     # 优化 8（加载速度）：写搜索缓存（TTL 内重复播放/整轨不重复搜 musicdl）
     try:
         _NETEASE_CAND_CACHE[guid] = (time.monotonic(), list(out))
+        _netease_cand_cache_prune()
     except Exception:  # noqa: BLE001
         pass
     return out
