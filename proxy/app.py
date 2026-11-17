@@ -7986,7 +7986,7 @@ async def _netease_prefetch_loop(fastapi_app: FastAPI) -> None:
                             cnt = int(card.get("trackCount") or card.get("track_count") or 0)
                         except (TypeError, ValueError):
                             cnt = 0
-                        if cnt > _NETEASE_PREFETCH_MAX_TRACKS:
+                        if cnt > _netease_prefetch_max_tracks():
                             logger.info("netease prefetch skip large playlist %s (%s tracks)", pid, cnt)
                             continue
                         tracks = await nmpl.load_tracks(musicbox, pid, build_online_track)
@@ -8009,7 +8009,7 @@ async def _netease_prefetch_loop(fastapi_app: FastAPI) -> None:
                             tracks = (bundle or {}).get("tracks") or []
                             if not tracks:
                                 continue
-                            if len(tracks) > _NETEASE_PREFETCH_MAX_TRACKS:
+                            if len(tracks) > _netease_prefetch_max_tracks():
                                 logger.info("netease prefetch skip large daily %s (%s tracks)",
                                             path, len(tracks))
                                 continue
@@ -8030,7 +8030,16 @@ async def _netease_prefetch_loop(fastapi_app: FastAPI) -> None:
 
 
 _NETEASE_PREFETCH_INTERVAL_S = 1800
-_NETEASE_PREFETCH_MAX_TRACKS = 120
+# 优化 2：大歌单整轨阈值 env 可配（FNMUSIC_NETEASE_PREFETCH_MAX，默认 120；>阈值歌单跳过，
+# 避免凌晨一次全量下载打满带宽/存储。用户可调高或设 0 关闭限制）。
+def _netease_prefetch_max_tracks() -> int:
+    raw = os.environ.get("FNMUSIC_NETEASE_PREFETCH_MAX", "120")
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 120
+
+_NETEASE_PREFETCH_MAX_TRACKS = _netease_prefetch_max_tracks()
 
 
 async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
