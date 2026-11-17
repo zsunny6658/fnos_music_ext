@@ -7928,6 +7928,80 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str,
     return True
 
 
+
+def _is_late_night() -> bool:
+    """凌晨整轨下载窗口：0-6 点（本地时）。"""
+    return 0 <= time.localtime().tm_hour < 6
+
+
+async def _netease_playlist_full_fetch(request: Request, tracks: list) -> None:
+    """网易歌单曲目（翻唱→dl/lx 正版）整轨下载落盘+刮削（凌晨窗口）。
+
+    对每首网易曲目：_netease_authentic_candidates 找 dl/lx 正版 → 后台整轨下载落盘
+    （_full_fetch_download → _tee_finalize 刮削 + _auto_lyric_after_finalize 歌词）。
+    任何异常不阻断后续曲目；只在凌晨窗口被调用（成本高，带宽/存储）。
+    """
+    if not tracks:
+        return
+    for track in tracks:
+        guid = str(track.get("guid") or "")
+        if not guid or source_from_online_guid(guid) != "netease":
+            continue
+        try:
+            authentic = await _netease_authentic_candidates(request, guid, track)
+            for g in authentic:
+                _register_background_fetch(request, g, "tee_save_enabled")
+        except Exception:  # noqa: BLE001
+            continue
+
+
+async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
+    """播放中：网易歌单当前曲目 → 下一首 → 预取 dl/lx 正版 URL + 元数据刮削。
+
+    客户端播放网易歌单曲目（heartbeat 上报）时，顺带把歌单里下一首的 dl/lx 正版
+    URL 预取（首字节探测，_open_online_stream）+ 元数据刮削（register_online_meta
+    已注册，无需额外写库）。网易曲目才触发；非网易曲目直接返回。
+    """
+    if not current_guid or source_from_online_guid(current_guid) != "netease":
+        return
+    # 网易歌单/推荐缓存按 guid 找当前曲目所在列表 → 下一首
+    for root in (nmpl.cache_dir(), dailyrec.recommend_cache_dir()):
+        for path in _iter_registry_jsons(root):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:  # noqa: BLE001
+                continue
+            tracks = (data or {}).get("tracks") or []
+            for idx, tr in enumerate(tracks):
+                if str(tr.get("guid") or "") != current_guid:
+                    continue
+                if idx + 1 >= len(tracks):
+                    return
+                nxt = tracks[idx + 1]
+                nguid = str(nxt.get("guid") or "")
+                if not nguid or source_from_online_guid(nguid) != "netease":
+                    return
+                try:
+                    authentic = await _netease_authentic_candidates(request, nguid, nxt)
+                    for g in authentic:
+                        if source_from_online_guid(g) == "lx":
+                            _prefetch_lx(request, g)
+                        else:
+                            asyncio.create_task(_prime_dl_url(request, g))
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+
+async def _prime_dl_url(request: Request, guid: str) -> None:
+    """musicdl 正版 URL 预取（首字节探测，不落盘）：解析 URL 拿首字节验证可用。"""
+    try:
+        await _open_online_stream(request, guid, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _register_full_fetch(request: Request, guid: str) -> None:
     """定长窗口拉流客户端的边听边存兜底：注册后台整轨下载，客户端请求照常服务。
 
@@ -9938,6 +10012,8 @@ async def track_transcode_session(request: Request):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     if request.url.path.endswith("/heartbeat"):
         tc.heartbeat(guid)
+        # 播放中：网易歌单下一首预取 dl/lx 正版 URL + 元数据刮削（不阻塞心跳响应）
+        asyncio.create_task(_netease_next_prefetch(request, guid))
         try:
             await tc.maintain(CONF["cache_dir"], float(CONF.get("transcode_ttl_s") or 90),
                               max(16, int(CONF.get("transcode_cache_max_mb") or 512)) * 1024 * 1024)
@@ -12696,6 +12772,8 @@ async def playlist_track_list(request: Request):
             tracks[start:start + size],
             await _online_favorite_set_for_user(user_guid),
         )
+        if _is_late_night():
+            asyncio.create_task(_netease_playlist_full_fetch(request, tracks))
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
