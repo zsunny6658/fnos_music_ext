@@ -1435,6 +1435,9 @@ def _authentic_match(needle: dict, candidate: dict) -> bool:
 
 # 优化 6：网易候选元数据缓存（guid → (title, artist)），供整轨前本地原唱检测
 _NETEASE_CAND_META: dict[str, tuple] = {}
+# 优化 8（加载速度）：网易曲目搜索结果缓存（guid → (时间戳, 候选列表)），TTL 内不重复搜 musicdl
+_NETEASE_CAND_CACHE: dict[str, tuple] = {}
+_NETEASE_CAND_CACHE_TTL_S = 1800.0
 
 
 async def _netease_authentic_candidates(
@@ -1451,6 +1454,13 @@ async def _netease_authentic_candidates(
     """
     if not (CONF.get("musicdl_enabled") or CONF.get("lx_enabled")):
         return []
+    # 优化 8（加载速度）：TTL 内命中缓存直接返回（不重复搜 musicdl，播放启动更快）
+    try:
+        _hit = _NETEASE_CAND_CACHE.get(guid)
+        if _hit and time.monotonic() - _hit[0] < _NETEASE_CAND_CACHE_TTL_S:
+            return list(_hit[1])
+    except Exception:  # noqa: BLE001
+        pass
     # item 可能为空（网易歌单曲目不在搜索缓存，在推荐/网易歌单缓存）
     if not item:
         item = (_lookup_playlist_cache_track(guid) or _lookup_online_snapshot(guid) or {})
@@ -1551,6 +1561,11 @@ async def _netease_authentic_candidates(
         needle_dur = float(item.get("duration_s") or 0)
         if needle_dur > 0:
             out.sort(key=lambda g: abs(_dur_map.get(g, 0.0) - needle_dur))
+    except Exception:  # noqa: BLE001
+        pass
+    # 优化 8（加载速度）：写搜索缓存（TTL 内重复播放/整轨不重复搜 musicdl）
+    try:
+        _NETEASE_CAND_CACHE[guid] = (time.monotonic(), list(out))
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -8115,6 +8130,19 @@ async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
                 try:
                     authentic = await _netease_authentic_candidates(request, nguid, nxt)
                     for g in authentic:
+                        # 优化 7：下一首候选本地已有原唱 → 跳过预取（本地已入库）
+                        meta = _NETEASE_CAND_META.get(g)
+                        if meta and meta[0] and meta[1]:
+                            try:
+                                db_path = str(CONF.get("music_db") or dailyrec.music_db_path())
+                                local = await asyncio.to_thread(
+                                    localmatch.resolve_in_library, db_path, meta[0], meta[1])
+                                if local is not None:
+                                    fn_diag(logger, "netease_nextprefetch_local_hit", guid=g,
+                                            title=meta[0])
+                                    continue
+                            except Exception:  # noqa: BLE001
+                                pass
                         if source_from_online_guid(g) == "lx":
                             _prefetch_lx(request, g)
                         else:
