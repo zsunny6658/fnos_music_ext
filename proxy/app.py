@@ -7936,10 +7936,25 @@ def _register_background_fetch(request: Request, guid: str, gate_key: str,
     if now - _full_fetch_failed.get(guid, -_FULL_FETCH_COOLDOWN_S) < _FULL_FETCH_COOLDOWN_S:
         return False
     headers = copy_incoming_headers(request)
-    download = (_full_fetch_download(guid, headers, direct_target=direct_target)
-                if direct_target is not None else _full_fetch_download(guid, headers))
+    download = (_bounded_full_fetch(guid, headers, direct_target=direct_target)
+                if direct_target is not None else _bounded_full_fetch(guid, headers))
     _full_fetch_tasks[guid] = asyncio.create_task(download)
     return True
+
+
+# 优化 5：整轨下载并发限制（信号量），避免大歌单凌晨一次并发打满带宽/文件句柄。
+# _FULL_FETCH_MAX_CONCURRENT 可配（env FNMUSIC_FULL_FETCH_CONCURRENCY，默认 3）。
+_FULL_FETCH_MAX_CONCURRENT = 3
+_FULL_FETCH_SEM = asyncio.Semaphore(_FULL_FETCH_MAX_CONCURRENT)
+
+async def _bounded_full_fetch(guid: str, cred_headers: dict,
+                              direct_target: "DirectMediaTarget | None" = None) -> None:
+    """信号量限并发版整轨下载（排队等待，不占满带宽）。"""
+    async with _FULL_FETCH_SEM:
+        if direct_target is not None:
+            await _full_fetch_download(guid, cred_headers, direct_target=direct_target)
+        else:
+            await _full_fetch_download(guid, cred_headers)
 
 
 
