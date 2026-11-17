@@ -9709,18 +9709,19 @@ async def stream_track(request: Request, subpath: str = ""):
         localmatch.clear_served(guid)
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext),
                                      delivery_kind="cached", delivery_guid=guid)
-    direct = await _direct_redirect_response(request, guid)
-    if direct is not None:
-        return direct
     item, entry = _retained_track(request, guid)
     candidates = [guid]
     # 网易曲目（含网易账号歌单/推荐里的网易曲目）→ 优先 dl/lx 正版（非翻唱）
     # 用户需求：网易播放源可能是翻唱/版权受限，用元数据搜 dl/lx 找原唱正版。
+    # 网易曲目（翻唱）先 dl/lx 原唱，网易 direct 兜底（认证通过才走网易直链）。
     if source_from_online_guid(guid) == "netease":
         authentic = await _netease_authentic_candidates(request, guid, item)
         if authentic:
             candidates = authentic + candidates
             fn_diag(logger, "netease_authentic_priority", guid=guid, candidates=len(authentic))
+    direct = await _direct_redirect_response(request, guid)
+    if direct is not None and source_from_online_guid(guid) != "netease":
+        return direct
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in ordered_stream_alternatives(item)]
