@@ -7999,6 +7999,29 @@ async def _netease_prefetch_loop(fastapi_app: FastAPI) -> None:
                         await _netease_playlist_full_fetch(req, tracks)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("netease prefetch pass failed: %s", type(exc).__name__)
+                # 优化 1：网易每日推荐曲目也整轨（遍历磁盘每日推荐缓存，不依赖内存/客户端访问）
+                try:
+                    daily_dir = dailyrec.recommend_cache_dir()
+                    for path in glob.glob(os.path.join(daily_dir, "*", "daily-*.json")):
+                        try:
+                            with open(path, encoding="utf-8") as f:
+                                bundle = json.load(f)
+                            tracks = (bundle or {}).get("tracks") or []
+                            if not tracks:
+                                continue
+                            if len(tracks) > _NETEASE_PREFETCH_MAX_TRACKS:
+                                logger.info("netease prefetch skip large daily %s (%s tracks)",
+                                            path, len(tracks))
+                                continue
+                            scope = {"type": "http", "method": "GET", "path": "/netease-prefetch-daily",
+                                     "query_string": b"", "headers": [], "client": ("127.0.0.1", 0),
+                                     "app": fastapi_app}
+                            req = Request(scope)
+                            await _netease_playlist_full_fetch(req, tracks)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("netease prefetch daily failed: %s", type(exc).__name__)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("netease prefetch daily pass failed: %s", type(exc).__name__)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
