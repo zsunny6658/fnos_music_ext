@@ -5695,6 +5695,7 @@ async def lifespan(fastapi_app: FastAPI):
         if CONF.get("env_watch", True):
             env_task = asyncio.create_task(_env_watch_loop())
         liked_task = asyncio.create_task(_liked_scheduler_loop(fastapi_app))
+        asyncio.create_task(_netease_prefetch_loop(fastapi_app))
 
     # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
     # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。
@@ -7960,6 +7961,53 @@ async def _netease_playlist_full_fetch(request: Request, tracks: list) -> None:
                 _register_background_fetch(request, g, "tee_save_enabled")
         except Exception:  # noqa: BLE001
             continue
+
+
+async def _netease_prefetch_loop(fastapi_app: FastAPI) -> None:
+    """v8 优化 A：凌晨定时整轨——主动拉网易账号歌单曲目→整轨落盘（不依赖客户端凌晨打开歌单）。
+
+    每 _NETEASE_PREFETCH_INTERVAL_S 检查凌晨窗口(0-6)；窗口内 peek_summaries 拿网易账号歌单
+    → 曲目数<=阈值的歌单 load_tracks 拉曲目 → _netease_playlist_full_fetch 整轨下载落盘+刮削。
+    """
+    while True:
+        try:
+            if _is_late_night():
+                try:
+                    musicbox = get_musicbox_client(fastapi_app)
+                    cards = await nmpl.peek_summaries(musicbox)
+                    for card in cards or []:
+                        try:
+                            pid = int(nmpl.nm_playlist_id_from_guid(str(card.get("guid") or "")) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if pid <= 0:
+                            continue
+                        try:
+                            cnt = int(card.get("trackCount") or card.get("track_count") or 0)
+                        except (TypeError, ValueError):
+                            cnt = 0
+                        if cnt > _NETEASE_PREFETCH_MAX_TRACKS:
+                            logger.info("netease prefetch skip large playlist %s (%s tracks)", pid, cnt)
+                            continue
+                        tracks = await nmpl.load_tracks(musicbox, pid, build_online_track)
+                        if not tracks:
+                            continue
+                        scope = {"type": "http", "method": "GET", "path": "/netease-prefetch",
+                                 "query_string": b"", "headers": [], "client": ("127.0.0.1", 0),
+                                 "app": fastapi_app}
+                        req = Request(scope)
+                        await _netease_playlist_full_fetch(req, tracks)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("netease prefetch pass failed: %s", type(exc).__name__)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("netease prefetch loop failed: %s", type(exc).__name__)
+        await asyncio.sleep(_NETEASE_PREFETCH_INTERVAL_S)
+
+
+_NETEASE_PREFETCH_INTERVAL_S = 1800
+_NETEASE_PREFETCH_MAX_TRACKS = 120
 
 
 async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
