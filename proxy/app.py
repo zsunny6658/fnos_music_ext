@@ -1433,6 +1433,10 @@ def _authentic_match(needle: dict, candidate: dict) -> bool:
     return _is_authentic_candidate(candidate)
 
 
+# 优化 6：网易候选元数据缓存（guid → (title, artist)），供整轨前本地原唱检测
+_NETEASE_CAND_META: dict[str, tuple] = {}
+
+
 async def _netease_authentic_candidates(
     request: Request, guid: str, item: dict | None
 ) -> list[str]:
@@ -1496,6 +1500,11 @@ async def _netease_authentic_candidates(
                     _dur_map[g] = float(c.get("duration_s") or 0)
                 except (TypeError, ValueError):
                     _dur_map[g] = 0.0
+                # 优化 6：记录候选元数据（title/artist）供本地原唱检测
+                try:
+                    _NETEASE_CAND_META[g] = (str(c.get("title") or ""), str(c.get("artist") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _search(keyword: str, exclude_artist: str = "") -> bool:
         """返回阶段内是否候选含网易歌手（翻唱检测）。"""
@@ -7979,6 +7988,19 @@ async def _netease_playlist_full_fetch(request: Request, tracks: list) -> None:
         try:
             authentic = await _netease_authentic_candidates(request, guid, track)
             for g in authentic:
+                # 优化 6：本地已有原唱（如阿桑-一直很安静）则跳过 dl/lx 整轨下载（本地已入库）
+                meta = _NETEASE_CAND_META.get(g)
+                if meta and meta[0] and meta[1]:
+                    try:
+                        db_path = str(CONF.get("music_db") or dailyrec.music_db_path())
+                        local = await asyncio.to_thread(
+                            localmatch.resolve_in_library, db_path, meta[0], meta[1])
+                        if local is not None:
+                            fn_diag(logger, "netease_fullfetch_local_hit", guid=g,
+                                    title=local.get("title") or meta[0])
+                            continue
+                    except Exception:  # noqa: BLE001
+                        pass
                 _register_background_fetch(request, g, "tee_save_enabled")
         except Exception:  # noqa: BLE001
             continue
