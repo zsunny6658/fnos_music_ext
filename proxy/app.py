@@ -8131,6 +8131,41 @@ def _netease_prefetch_max_tracks() -> int:
 _NETEASE_PREFETCH_MAX_TRACKS = _netease_prefetch_max_tracks()
 
 
+def _apply_netease_authentic_meta(tracks: list) -> None:
+    """优化 12（问题2修复）：网易曲目 UI 元数据覆盖为 dl/lx 原唱。
+
+    网易歌单曲目（网易元数据：男歌手标题）实际播放 dl/lx 原唱（女声）——
+    对已缓存候选（_NETEASE_CAND_CACHE + _NETEASE_CAND_META）的网易曲目，
+    用候选（原唱）的 title/artist 覆盖，UI 显示与音频一致。
+    只覆盖已搜索过的（缓存命中），未缓存的保持网易元数据（不阻塞歌单返回）。
+    """
+    try:
+        for tr in tracks:
+            if not isinstance(tr, dict):
+                continue
+            guid = str(tr.get("guid") or "")
+            if not guid or source_from_online_guid(guid) != "netease":
+                continue
+            cache_hit = _NETEASE_CAND_CACHE.get(guid)
+            if not cache_hit or not cache_hit[1]:
+                continue
+            cand = cache_hit[1][0]
+            meta = _NETEASE_CAND_META.get(cand)
+            if not meta or not meta[0]:
+                continue
+            c_title, c_artist = meta
+            if c_title:
+                tr["title"] = c_title
+                tr["name"] = c_title
+            if c_artist:
+                tr["artist"] = c_artist
+                for a in (tr.get("artists") or []):
+                    if isinstance(a, dict):
+                        a["name"] = c_artist
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
     """播放中：网易歌单当前曲目 → 下一首 → 预取 dl/lx 正版 URL + 元数据刮削。
 
@@ -8138,7 +8173,27 @@ async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
     URL 预取（首字节探测，_open_online_stream）+ 元数据刮削（register_online_meta
     已注册，无需额外写库）。网易曲目才触发；非网易曲目直接返回。
     """
-    if not current_guid or source_from_online_guid(current_guid) != "netease":
+    if not current_guid:
+        return
+    # 优化 11（问题1修复）：当前播放可能是 dl/lx 原唱（网易歌单曲目→dl/lx），
+    # heartbeat 上报的是 dl/lx guid（非网易）——回溯到网易曲目 guid 才能找下一首。
+    if source_from_online_guid(current_guid) != "netease":
+        try:
+            for _ng, _cands in _NETEASE_CAND_CACHE.items():
+                if current_guid in _cands[1]:
+                    current_guid = _ng
+                    break
+            else:
+                # 也查 _NETEASE_CAND_META（候选元数据）里是否有该 guid
+                for _ng, _cands in _NETEASE_CAND_META.items():
+                    if current_guid == _cands[0]:
+                        current_guid = _ng
+                        break
+                else:
+                    return
+        except Exception:  # noqa: BLE001
+            return
+    if source_from_online_guid(current_guid) != "netease":
         return
     # 网易歌单/推荐缓存按 guid 找当前曲目所在列表 → 下一首
     for root in (nmpl.cache_dir(), dailyrec.recommend_cache_dir()):
@@ -12962,6 +13017,10 @@ async def playlist_track_list(request: Request):
             await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
         )
         register_online_meta(tracks)
+        # 优化 12（问题2修复）：网易歌单曲目 UI 标题/歌手覆盖为 dl/lx 原唱元数据。
+        # 网易曲目播放的是 dl/lx 原唱（女声），但曲目返回用网易元数据（男歌手标题）——
+        # 覆盖为候选（原唱）的 title/artist，避免 UI 显示男歌手实际播女声。
+        _apply_netease_authentic_meta(tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
