@@ -8826,30 +8826,36 @@ def _netease_prefetch_max_tracks() -> int:
 _NETEASE_PREFETCH_MAX_TRACKS = _netease_prefetch_max_tracks()
 
 
-def _apply_netease_authentic_meta(tracks: list) -> None:
+async def _apply_netease_authentic_meta(tracks: list, request: "Request | None" = None) -> None:
     """优化 12（问题2修复）：网易曲目 UI 元数据覆盖为 dl/lx 原唱。
     优化 14（用户底线：歌曲/歌手/歌名/封面全部对应实际播放）：
     覆盖 title/name/artist/artists[0].name + cover（封面）+ album + duration_s。
+    优化 15（首次打开歌单也覆盖）：未缓存曲目并发搜索（前 N 首，避免全量
+    阻塞），已缓存直接覆盖；其余异步后台补搜（下次刷新覆盖）。
 
     网易歌单曲目（网易元数据：男歌手标题）实际播放 dl/lx 原唱（女声）——
     对已缓存候选（_NETEASE_CAND_CACHE + _NETEASE_CAND_META）的网易曲目，
     用候选（原唱）的完整元数据覆盖，UI 显示与音频一致。
-    只覆盖已搜索过的（缓存命中），未缓存的保持网易元数据（不阻塞歌单返回）。
     """
     try:
+        netease_tracks = []
         for tr in tracks:
             if not isinstance(tr, dict):
                 continue
             guid = str(tr.get("guid") or "")
-            if not guid or source_from_online_guid(guid) != "netease":
-                continue
+            if guid and source_from_online_guid(guid) == "netease":
+                netease_tracks.append((guid, tr))
+        if not netease_tracks:
+            return
+
+        async def _cover_one(guid: str, tr: dict) -> None:
             cache_hit = _NETEASE_CAND_CACHE.get(guid)
             if not cache_hit or not cache_hit[1]:
-                continue
+                return
             cand = cache_hit[1][0]
             meta = _NETEASE_CAND_META.get(cand)
             if not meta or not meta[0]:
-                continue
+                return
             c_title = meta[0]
             c_artist = meta[1]
             c_cover = meta[2] if len(meta) > 2 else ""
@@ -8863,11 +8869,9 @@ def _apply_netease_authentic_meta(tracks: list) -> None:
                 for a in (tr.get("artists") or []):
                     if isinstance(a, dict):
                         a["name"] = c_artist
-            # 优化 14：封面/专辑/时长覆盖（UI 显示与实际播放的候选一致）
             if c_cover:
                 tr["cover"] = c_cover
                 tr["cover_url"] = c_cover
-                # 常见封面字段名
                 for k in ("pic", "pic_url", "album_pic_url", "img", "image"):
                     if k in tr:
                         tr[k] = c_cover
@@ -8879,6 +8883,38 @@ def _apply_netease_authentic_meta(tracks: list) -> None:
                     tr["duration_s"] = float(c_dur)
                 except (TypeError, ValueError):
                     pass
+
+        async def _search_and_cover(guid: str, tr: dict) -> None:
+            try:
+                if not request:
+                    return
+                await asyncio.wait_for(_netease_authentic_candidates(request, guid, tr), timeout=15.0)
+                await _cover_one(guid, tr)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 已缓存曲目直接覆盖（快）
+        uncached = []
+        for guid, tr in netease_tracks:
+            if _NETEASE_CAND_CACHE.get(guid) and _NETEASE_CAND_CACHE.get(guid)[1]:
+                await _cover_one(guid, tr)
+            else:
+                uncached.append((guid, tr))
+        # 未缓存：并发搜索前 N 首（首屏可见，避免全量阻塞歌单返回）
+        if uncached:
+            first_n = uncached[:15]
+            rest = uncached[15:]
+            # 并发搜索（信号量限并发，避免打满 musicdl 搜索）
+            sem = asyncio.Semaphore(5)
+
+            async def _bounded(g: str, t: dict) -> None:
+                async with sem:
+                    await _search_and_cover(g, t)
+
+            await asyncio.gather(*[_bounded(g, t) for g, t in first_n], return_exceptions=True)
+            # 其余异步后台补搜（下次刷新覆盖）
+            for g, t in rest:
+                asyncio.create_task(_search_and_cover(g, t))
     except Exception:  # noqa: BLE001
         pass
 
@@ -14003,9 +14039,9 @@ async def playlist_track_list(request: Request):
         )
         register_online_meta(tracks)
         # 优化 12（问题2修复）：网易歌单曲目 UI 标题/歌手覆盖为 dl/lx 原唱元数据。
-        # 网易曲目播放的是 dl/lx 原唱（女声），但曲目返回用网易元数据（男歌手标题）——
-        # 覆盖为候选（原唱）的 title/artist，避免 UI 显示男歌手实际播女声。
-        _apply_netease_authentic_meta(tracks)
+        # 优化 15（首次打开歌单也覆盖）：未缓存曲目并发搜索（前 N 首）覆盖，
+        # 避免歌单显示网易元数据（男歌手）实际播放 dl/lx 原唱（女声）牛头不对马嘴。
+        await _apply_netease_authentic_meta(tracks, request)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
