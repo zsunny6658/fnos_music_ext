@@ -8494,7 +8494,11 @@ async def _direct_redirect_response(request: Request, guid: str) -> Response | N
             return _direct_error(502, "target_expired")
         if target.ext.lower() in ("m3u8", "m3u") or target.protocol.lower() in ("hls", "m3u8"):
             return _direct_error(502, "original_file_required")
-        decision = await asyncio.to_thread(validate_media_url, target.url)
+        # 优化 13（问题1修复）：网易曲目 dl/lx 原唱候选（kuwo/migu，musicdl 解析）
+        # 直链可能是 http（非网易 CDN）——musicdl 音源是可信来源，http 直链允许
+        # 播放（避免 scheme_not_https → 502 无兜底）。网易/lx 保持严格 https。
+        require_https = provider != "musicdl"
+        decision = await asyncio.to_thread(validate_media_url, target.url, require_https=require_https)
         if not decision.ok:
             fn_diag(logger, "direct_rejected", guid=guid, reason=decision.reason, host=decision.host)
             return _direct_error(502, decision.reason)
@@ -10069,6 +10073,11 @@ async def stream_track(request: Request, subpath: str = ""):
             if source_from_online_guid(candidate) not in ("netease", "lx"):
                 if not await _recover_source(request, candidate, entry):
                     break
+            # 优化 13（问题1修复）：网易曲目播放时，dl/lx 原唱候选 502/失败后
+            # 不直接 break——继续到下一个候选（网易自身 → 网易 direct 兜底），
+            # 避免"dl/lx 原唱 http 直链被拒 → 404/502 无兜底"。
+            if source_from_online_guid(guid) == "netease":
+                continue
             # 直链源的 URL 刷新不依赖搜索缓存；收藏/重启/缓存过期也可有界重试。
     # issue #51/#52：搜到但不能播的最终结局留档（候选源、启用状态）
     fn_diag(logger, "stream_unresolved", guid=guid,
