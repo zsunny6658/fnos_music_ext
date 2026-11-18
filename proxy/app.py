@@ -1451,6 +1451,31 @@ _AUTHENTIC_NEGATIVE_MARKERS = (
     "二胡版", "古筝版", "竹笛", "陶笛", "排箫", "竖琴",
 )
 
+# 优化 16（用户澄清"你是人间四月天原唱=邵帅" + "有翻唱/cover 标记找原唱，
+# 有 Live 标记找专辑好音质版本"）：
+# 网易曲目按标记分类决定替换策略：
+#   翻唱类标记 → 找其他歌手原唱（阶段2 排除网易歌手）
+#   Live 类标记（无翻唱类）→ 找同歌手专辑版（好音质）
+#   无标记 → 网易曲目即原唱（不替换，播放网易原版）
+# 翻唱类：歌名/歌手被其他歌手翻唱或改编（换人/换编曲）
+_COVER_MARKERS = (
+    "翻唱", "cover", "remix", "改编", "remake", "rework",
+    "空灵", "治愈", "微醺", "深情", "清晨", "落潮", "沉浸", "寻光", "氛围",
+    "烟嗓", "抒情版", "温柔版", "清新版", "唯美版", "伤感版", "民谣版", "摇滚版",
+    "电音版", "慢摇版", "加速版", "降调版", "升调版", "女声版", "男声版", "童声版",
+    "吉他版", "钢琴版", "提琴版", "古筝版", "笛子版", "二胡版", "萨克斯", "大提琴",
+    "小提琴", "口琴", "钢琴曲", "竹笛", "陶笛", "排箫", "竖琴",
+    "女声", "男声", "童声", "纯音乐版", "清唱", "哼唱", "卡拉ok", "karaoke",
+    "instrumental版", "人声版", "伴奏", "instrumental", "合唱", "合唱版", "合唱团",
+    "弦乐版", "管弦乐", "交响乐", "古风版", "国风版", "dj", "dj版", "电音",
+    "网络版", "铃声版", "翻唱版", "cover版",
+)
+# Live 类：同一首歌/同一歌手的现场/演唱会/影视/剧情版本 → 找专辑版（好音质）
+_LIVE_MARKERS = (
+    "live", "现场", "演唱会", "现场版", "live版",
+    "剧场版", "剧情版", "电影版", "片尾曲", "插曲", "主题曲",
+)
+
 
 def _strip_version(text: str) -> str:
     """去掉标题里的版本/备注后缀（如 （翻唱）/ (Live) 等），保留核心歌名。"""
@@ -1584,7 +1609,7 @@ async def _netease_authentic_candidates(
     _dur_map: dict[str, float] = {}
     n_artist_cf = str(artist or "").strip().casefold()
 
-    async def _collect(cands: list[dict], exclude_artist: str = "") -> None:
+    async def _collect(cands: list[dict], exclude_artist: str = "", only_same_artist: bool = False) -> None:
         for c in cands or []:
             if not isinstance(c, dict) or not _authentic_match(item, c):
                 continue
@@ -1592,6 +1617,11 @@ async def _netease_authentic_candidates(
             if exclude_artist:
                 c_artist_cf = str(c.get("artist") or "").casefold()
                 if exclude_artist in c_artist_cf:
+                    continue
+            # 优化 16（Live 曲目找同歌手专辑版）：只收同歌手候选（专辑版）
+            if only_same_artist and n_artist_cf:
+                c_artist_cf = str(c.get("artist") or "").casefold()
+                if n_artist_cf not in c_artist_cf:
                     continue
             g = online_guid_from_item(c)
             if g and g not in seen and _source_enabled(g):
@@ -1618,7 +1648,7 @@ async def _netease_authentic_candidates(
                 except Exception:  # noqa: BLE001
                     pass
 
-    async def _search(keyword: str, exclude_artist: str = "") -> bool:
+    async def _search(keyword: str, exclude_artist: str = "", only_same_artist: bool = False) -> bool:
         """返回阶段内是否候选含网易歌手（翻唱检测）。"""
         hit_netease_artist = False
         try:
@@ -1633,7 +1663,7 @@ async def _netease_authentic_candidates(
                             n_artist_cf in str(c.get("artist") or "").casefold()
                             for c in items if isinstance(c, dict)):
                             hit_netease_artist = True
-                        await _collect(items, exclude_artist)
+                        await _collect(items, exclude_artist, only_same_artist)
                 if CONF.get("lx_enabled"):
                     r = await fetch_lx_search(
                         get_lx_client(request.app), keyword, int(CONF.get("lx_search_limit") or 20))
@@ -1642,26 +1672,40 @@ async def _netease_authentic_candidates(
                             n_artist_cf in str(c.get("artist") or "").casefold()
                             for c in r if isinstance(c, dict)):
                             hit_netease_artist = True
-                        await _collect(r, exclude_artist)
+                        await _collect(r, exclude_artist, only_same_artist)
             finally:
                 _FETCH_SCOPE.reset(token)
         except Exception as exc:  # noqa: BLE001
             logger.debug("netease authentic search failed %s: %s", keyword, type(exc).__name__)
         return hit_netease_artist
 
-    # 阶段1：搜 title+artist（网易原曲目）——若候选含网易歌手（翻唱）→ 阶段2 找原唱
-    hit = await _search(f"{title} {artist}".strip())
-    if hit:
-        # 网易曲目是翻唱：阶段2 只按 title 搜，排除翻唱者
+    # 优化 16（用户澄清"你是人间四月天原唱=邵帅" + "有翻唱/cover 标记找原唱，
+    # 有 Live 标记找专辑好音质版本"）：
+    # 网易曲目按标记分类决定替换策略：
+    #   翻唱类标记 → 找其他歌手原唱（阶段2 排除网易歌手）
+    #   Live 类标记（无翻唱类）→ 找同歌手专辑版（好音质）
+    #   无标记 → 网易曲目即原唱（不替换，播放网易原版，如邵帅）
+    _needle_text = " ".join([str(title or ""), str(artist or ""), str(item.get("version") or "")]).lower()
+    has_cover_marker = any(m in _needle_text for m in _COVER_MARKERS)
+    has_live_marker = any(m in _needle_text for m in _LIVE_MARKERS)
+    if has_cover_marker:
+        # 翻唱类：阶段2 只按 title 搜，排除翻唱者/翻唱标记找原唱（其他歌手）
         await _search(_strip_version(title), n_artist_cf)
-    # 兜底：阶段1 无候选且网易曲目标记翻唱 → 阶段2 也搜
-    if not out and not _is_authentic_candidate(item):
-        await _search(_strip_version(title), n_artist_cf)
+    elif has_live_marker:
+        # Live 类：找同歌手专辑版（好音质）——只收同歌手候选
+        await _search(_strip_version(title), "", only_same_artist=True)
+    else:
+        # 无标记：网易曲目即原唱（不替换）——仅阶段1（title+artist 精确匹配）
+        hit = await _search(f"{title} {artist}".strip())
+        # 兜底：阶段1 无候选（title+artist 搜不到）→ 按 title 搜，排除网易歌手
+        # （网易曲目是原唱但候选无同歌手版，可能网易源版权受限——仍优先原唱候选）
+        if not out:
+            await _search(_strip_version(title), n_artist_cf)
 
     # 最接近网易曲目时长（原唱基准）的正版优先播放（fetch 完成后排序）
-    # 优化 14（用户底线：UI 与实际播放一致）：原唱（非网易歌手）优先，
-    # 同歌手候选（翻唱/网易元数据重复）垫底——播放选原唱（如叶枫灵），
-    # 而非候选[0]（同歌手邵帅翻唱），避免 UI 显示邵帅实际播女声。
+    # 优化 14（用户底线：UI 与实际播放一致）：同歌手/其他歌手按策略排序。
+    # 优化 16（用户规则）：翻唱类 → 其他歌手（原唱）优先；Live 类 → 同歌手（专辑版）
+    # 优先；无标记 → 同歌手（网易原唱）优先。
     try:
         needle_dur = float(item.get("duration_s") or 0)
         if needle_dur > 0:
@@ -1670,9 +1714,12 @@ async def _netease_authentic_candidates(
             def _sort_key(g: str):
                 meta = _NETEASE_CAND_META.get(g)
                 m_artist = str(meta[1] if meta else "").strip().casefold() if meta else ""
-                # 同歌手（网易歌手，翻唱）垫底，原唱优先
                 is_same_artist = bool(_n_artist_cf) and _n_artist_cf in m_artist
-                return (1 if is_same_artist else 0, abs(_dur_map.get(g, 0.0) - needle_dur))
+                # 翻唱类：其他歌手（原唱）优先（同歌手翻唱垫底）
+                # Live/无标记：同歌手（专辑版/原唱）优先
+                prefer_same = (has_live_marker or not has_cover_marker)
+                return ((0 if is_same_artist else 1) if prefer_same else (1 if is_same_artist else 0),
+                        abs(_dur_map.get(g, 0.0) - needle_dur))
 
             out.sort(key=_sort_key)
         else:
@@ -1682,7 +1729,8 @@ async def _netease_authentic_candidates(
                 meta = _NETEASE_CAND_META.get(g)
                 m_artist = str(meta[1] if meta else "").strip().casefold() if meta else ""
                 is_same_artist = bool(_n_artist_cf) and _n_artist_cf in m_artist
-                return (1 if is_same_artist else 0, 0)
+                prefer_same = (has_live_marker or not has_cover_marker)
+                return ((0 if is_same_artist else 1) if prefer_same else (1 if is_same_artist else 0), 0)
 
             out.sort(key=_sort_key2)
     except Exception:  # noqa: BLE001
