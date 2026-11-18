@@ -1602,8 +1602,19 @@ async def _netease_authentic_candidates(
                 except (TypeError, ValueError):
                     _dur_map[g] = 0.0
                 # 优化 6：记录候选元数据（title/artist）供本地原唱检测
+                # 优化 14（用户底线：歌曲/歌手/歌名/封面对应实际播放）：
+                # 扩展存完整元数据（title/artist/cover_url/album/duration_s/ext/source/id）
                 try:
-                    _NETEASE_CAND_META[g] = (str(c.get("title") or ""), str(c.get("artist") or ""))
+                    _NETEASE_CAND_META[g] = (
+                        str(c.get("title") or ""),
+                        str(c.get("artist") or ""),
+                        str(c.get("cover_url") or ""),
+                        str(c.get("album") or ""),
+                        float(c.get("duration_s") or 0),
+                        str(c.get("ext") or ""),
+                        str(c.get("source") or ""),
+                        str(c.get("id") or ""),
+                    )
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1648,10 +1659,32 @@ async def _netease_authentic_candidates(
         await _search(_strip_version(title), n_artist_cf)
 
     # 最接近网易曲目时长（原唱基准）的正版优先播放（fetch 完成后排序）
+    # 优化 14（用户底线：UI 与实际播放一致）：原唱（非网易歌手）优先，
+    # 同歌手候选（翻唱/网易元数据重复）垫底——播放选原唱（如叶枫灵），
+    # 而非候选[0]（同歌手邵帅翻唱），避免 UI 显示邵帅实际播女声。
     try:
         needle_dur = float(item.get("duration_s") or 0)
         if needle_dur > 0:
-            out.sort(key=lambda g: abs(_dur_map.get(g, 0.0) - needle_dur))
+            _n_artist_cf = str(artist or "").strip().casefold()
+
+            def _sort_key(g: str):
+                meta = _NETEASE_CAND_META.get(g)
+                m_artist = str(meta[1] if meta else "").strip().casefold() if meta else ""
+                # 同歌手（网易歌手，翻唱）垫底，原唱优先
+                is_same_artist = bool(_n_artist_cf) and _n_artist_cf in m_artist
+                return (1 if is_same_artist else 0, abs(_dur_map.get(g, 0.0) - needle_dur))
+
+            out.sort(key=_sort_key)
+        else:
+            _n_artist_cf = str(artist or "").strip().casefold()
+
+            def _sort_key2(g: str):
+                meta = _NETEASE_CAND_META.get(g)
+                m_artist = str(meta[1] if meta else "").strip().casefold() if meta else ""
+                is_same_artist = bool(_n_artist_cf) and _n_artist_cf in m_artist
+                return (1 if is_same_artist else 0, 0)
+
+            out.sort(key=_sort_key2)
     except Exception:  # noqa: BLE001
         pass
     # 优化 8（加载速度）：写搜索缓存（TTL 内重复播放/整轨不重复搜 musicdl）
@@ -8795,10 +8828,12 @@ _NETEASE_PREFETCH_MAX_TRACKS = _netease_prefetch_max_tracks()
 
 def _apply_netease_authentic_meta(tracks: list) -> None:
     """优化 12（问题2修复）：网易曲目 UI 元数据覆盖为 dl/lx 原唱。
+    优化 14（用户底线：歌曲/歌手/歌名/封面全部对应实际播放）：
+    覆盖 title/name/artist/artists[0].name + cover（封面）+ album + duration_s。
 
     网易歌单曲目（网易元数据：男歌手标题）实际播放 dl/lx 原唱（女声）——
     对已缓存候选（_NETEASE_CAND_CACHE + _NETEASE_CAND_META）的网易曲目，
-    用候选（原唱）的 title/artist 覆盖，UI 显示与音频一致。
+    用候选（原唱）的完整元数据覆盖，UI 显示与音频一致。
     只覆盖已搜索过的（缓存命中），未缓存的保持网易元数据（不阻塞歌单返回）。
     """
     try:
@@ -8815,7 +8850,11 @@ def _apply_netease_authentic_meta(tracks: list) -> None:
             meta = _NETEASE_CAND_META.get(cand)
             if not meta or not meta[0]:
                 continue
-            c_title, c_artist = meta
+            c_title = meta[0]
+            c_artist = meta[1]
+            c_cover = meta[2] if len(meta) > 2 else ""
+            c_album = meta[3] if len(meta) > 3 else ""
+            c_dur = meta[4] if len(meta) > 4 else 0
             if c_title:
                 tr["title"] = c_title
                 tr["name"] = c_title
@@ -8824,6 +8863,22 @@ def _apply_netease_authentic_meta(tracks: list) -> None:
                 for a in (tr.get("artists") or []):
                     if isinstance(a, dict):
                         a["name"] = c_artist
+            # 优化 14：封面/专辑/时长覆盖（UI 显示与实际播放的候选一致）
+            if c_cover:
+                tr["cover"] = c_cover
+                tr["cover_url"] = c_cover
+                # 常见封面字段名
+                for k in ("pic", "pic_url", "album_pic_url", "img", "image"):
+                    if k in tr:
+                        tr[k] = c_cover
+            if c_album:
+                tr["album"] = c_album
+                tr["album_name"] = c_album
+            if c_dur:
+                try:
+                    tr["duration_s"] = float(c_dur)
+                except (TypeError, ValueError):
+                    pass
     except Exception:  # noqa: BLE001
         pass
 
