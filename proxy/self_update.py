@@ -37,11 +37,11 @@ from proxy.update_release import (
 )
 from proxy.version import get_version, read_release_channel, ui_version
 
-DEFAULT_GITHUB_REPO = "javycoder/fnos_music_ext"
-DEFAULT_GITEE_REPO = "javycoder/fnos_music_ext"
+DEFAULT_GITHUB_REPO = "zsunny6658/fnos_music_ext"
+DEFAULT_GITEE_REPO = "zsunny6658/fnos_music_ext"
 DAEMON_SOCKET = "/var/run/com.trim.app.center.sock"
 FALLBACK_FAIL_MESSAGE = "下载失败，请到 GitHub 下载最新版本。"
-GITHUB_RELEASE_PAGE = "https://github.com/javycoder/fnos_music_ext/releases"
+GITHUB_RELEASE_PAGE = "https://github.com/zsunny6658/fnos_music_ext/releases"
 logger = logging.getLogger(__name__)
 
 DATA_BACKUP_ITEMS = (
