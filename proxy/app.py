@@ -8978,19 +8978,27 @@ async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
         return
     # 优化 11（问题1修复）：当前播放可能是 dl/lx 原唱（网易歌单曲目→dl/lx），
     # heartbeat 上报的是 dl/lx guid（非网易）——回溯到网易曲目 guid 才能找下一首。
+    _orig_guid = current_guid
     if source_from_online_guid(current_guid) != "netease":
         try:
             for _ng, _cands in _NETEASE_CAND_CACHE.items():
                 if current_guid in _cands[1]:
                     current_guid = _ng
+                    fn_diag(logger, "netease_nextprefetch_backtrace_cache",
+                            guid=_orig_guid, netease_guid=_ng, n=len(_cands[1]))
                     break
             else:
                 # 也查 _NETEASE_CAND_META（候选元数据）里是否有该 guid
                 for _ng, _cands in _NETEASE_CAND_META.items():
                     if current_guid == _cands[0]:
                         current_guid = _ng
+                        fn_diag(logger, "netease_nextprefetch_backtrace_meta",
+                                guid=_orig_guid, netease_guid=_ng)
                         break
                 else:
+                    fn_diag(logger, "netease_nextprefetch_backtrace_miss",
+                            guid=_orig_guid, cache_n=len(_NETEASE_CAND_CACHE),
+                            meta_n=len(_NETEASE_CAND_META))
                     return
         except Exception:  # noqa: BLE001
             return
@@ -9009,13 +9017,21 @@ async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
                 if str(tr.get("guid") or "") != current_guid:
                     continue
                 if idx + 1 >= len(tracks):
+                    fn_diag(logger, "netease_nextprefetch_last", guid=current_guid,
+                            idx=idx, total=len(tracks))
                     return
                 nxt = tracks[idx + 1]
                 nguid = str(nxt.get("guid") or "")
                 if not nguid or source_from_online_guid(nguid) != "netease":
+                    fn_diag(logger, "netease_nextprefetch_next_nonnm",
+                            guid=current_guid, nguid=nguid)
                     return
+                fn_diag(logger, "netease_nextprefetch_next", guid=current_guid,
+                        idx=idx, nguid=nguid, title=nxt.get("title"))
                 try:
                     authentic = await _netease_authentic_candidates(request, nguid, nxt)
+                    fn_diag(logger, "netease_nextprefetch_cands", guid=nguid,
+                            n=len(authentic), cands=authentic[:3])
                     for g in authentic:
                         # 优化 7：下一首候选本地已有原唱 → 跳过预取（本地已入库）
                         meta = _NETEASE_CAND_META.get(g)
@@ -9034,8 +9050,9 @@ async def _netease_next_prefetch(request: Request, current_guid: str) -> None:
                             _prefetch_lx(request, g)
                         else:
                             asyncio.create_task(_prime_dl_url(request, g))
+                        fn_diag(logger, "netease_nextprefetch_prime", guid=g)
                 except Exception:  # noqa: BLE001
-                    pass
+                    fn_diag(logger, "netease_nextprefetch_err", guid=nguid)
                 return
 
 
@@ -14032,6 +14049,7 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
+    logger.info("PLAYLIST-DETAIL-DEBUG: guid=%s qs=%s", guid, dict(request.query_params))
     guid = resolve_real_guid(guid)
     kind = dailyrec.online_playlist_kind(guid)
     public_entry = pubpl.entry_from_guid(guid) or pubpl.entry_from_guid(resolve_real_guid(guid))
@@ -14109,6 +14127,7 @@ async def playlist_track_list(request: Request):
         )
         if _is_late_night():
             asyncio.create_task(_netease_playlist_full_fetch(request, tracks))
+        logger.info("PLAYLIST-DETAIL-DEBUG: nm_pl_id=%s total=%d page_tracks=%d", nm_pl_id, len(tracks), len(page_tracks))
         return JSONResponse(
             content=disguise_client_json({
                 "code": 0,
