@@ -152,13 +152,13 @@ STATIC_BUILD_ID = _static_build_id()
 UPDATE_SOURCES = (
     {
         "name": "github",
-        "api": "https://api.github.com/repos/javycoder/fnos_music_ext/releases/latest",
-        "page": "https://github.com/javycoder/fnos_music_ext/releases",
+        "api": "https://api.github.com/repos/zsunny6658/fnos_music_ext/releases/latest",
+        "page": "https://github.com/zsunny6658/fnos_music_ext/releases",
     },
     {
         "name": "gitee",
-        "api": "https://gitee.com/api/v5/repos/javycoder/fnos_music_ext/releases/latest",
-        "page": "https://gitee.com/javycoder/fnos_music_ext/releases",
+        "api": "https://gitee.com/api/v5/repos/zsunny6658/fnos_music_ext/releases/latest",
+        "page": "https://gitee.com/zsunny6658/fnos_music_ext/releases",
     },
 )
 # 成功缓存 6 小时（GitHub 匿名限额 60 次/小时），双源皆败负缓存 10 分钟——
