@@ -1426,7 +1426,7 @@ def _version_newer(latest: str, current: str) -> bool:
     cnums += [0] * (size - len(cnums))
     return lnums > cnums or (
         lnums == cnums
-        and re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[0-9]+|[a-z])", (current or "").strip()) is not None
+        and re.fullmatch(r"v?\d+\.\d+\.\d+[a-z]", (current or "").strip()) is not None
     )
 
 
