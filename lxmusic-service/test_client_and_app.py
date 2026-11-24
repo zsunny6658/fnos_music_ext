@@ -16,6 +16,8 @@ from lxserver_client import (
     LxServerClient,
     extract_track_identifier,
     map_lxserver_song,
+    normalize_catalog_album,
+    normalize_catalog_artist,
     normalize_source,
     parse_interval_to_seconds,
     parse_size_bytes,
@@ -277,6 +279,94 @@ def test_map_lxserver_song_file_size_follows_display_container():
     # size 无法解析时留 0，不用别的档位顶替
     unknown = dict(raw, types=[{"type": "flac", "size": "??"}])
     assert map_lxserver_song(unknown)["file_size"] == 0
+
+
+def test_catalog_normalization_and_native_lxserver_contract():
+    """Issue #141：仅 tx/wy 暴露原生歌手/专辑契约，字段保留可跳转 ID。"""
+    artist = normalize_catalog_artist({
+        "id": "700", "name": "周杰伦", "picUrl": "http://pic/a.jpg",
+        "albumSize": 20, "musicSize": 300,
+    }, "tx")
+    assert artist == {
+        "source": "lx", "lx_source": "tx", "id": "700", "name": "周杰伦",
+        "pic_url": "http://pic/a.jpg", "alias": [], "album_count": 20, "track_count": 300,
+    }
+    album = normalize_catalog_album({
+        "id": "800", "name": "叶惠美", "artistName": "周杰伦", "artistId": "700",
+        "picUrl": "http://pic/al.jpg", "size": 10, "publishTime": "2003",
+    }, "wy")
+    assert album["lx_source"] == "wy"
+    assert album["artist_id"] == "700"
+    assert album["track_count"] == 10
+    assert normalize_catalog_artist({"id": "1", "name": "x"}, "kg") is None
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path, dict(request.url.params)))
+        payload = {
+            "/api/music/search": {"list": [{"id": "700", "name": "周杰伦"}], "total": 1},
+            "/api/music/artistDetail": {"id": "700", "name": "周杰伦", "avatar": "http://pic/a.jpg"},
+            "/api/music/artistSongs": [{"name": "晴天", "singer": "周杰伦", "songmid": "100"}],
+            "/api/music/artistAlbums": {"list": [{"id": "800", "name": "叶惠美"}], "total": 1},
+            "/api/music/albumSongs": {"list": [{"name": "晴天", "singer": "周杰伦"}], "name": "叶惠美"},
+        }.get(request.url.path)
+        assert payload is not None
+        return httpx.Response(200, json=payload)
+
+    client = LxServerClient(base_url="http://test")
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            assert await client.search_catalog("周杰伦", "artist", "tx", page=2, limit=5)
+            assert await client.get_artist_detail("tx", "700")
+            assert await client.get_artist_songs("wy", "700", "time")
+            assert await client.get_artist_albums("tx", "700", page=2)
+            assert await client.get_album_songs("wy", "800")
+            with pytest.raises(ValueError):
+                await client.search_catalog("周杰伦", "artist", "kg")
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert calls == [
+        ("/api/music/search", {"name": "周杰伦", "source": "tx", "type": "singer",
+                               "page": "2", "limit": "5"}),
+        ("/api/music/artistDetail", {"source": "tx", "id": "700"}),
+        ("/api/music/artistSongs", {"source": "wy", "id": "700", "order": "time"}),
+        ("/api/music/artistAlbums", {"source": "tx", "id": "700", "page": "2"}),
+        ("/api/music/albumSongs", {"source": "wy", "id": "800"}),
+    ]
+
+
+@pytest.mark.parametrize("page,size,native_pages", [(2, 20, [1]), (3, 20, [1, 2]), (2, 55, [2, 3])])
+def test_catalog_artist_albums_translates_fixed_native_pages(monkeypatch, test_app_client, page, size, native_pages):
+    calls = []
+    upstream = LxServerClient(base_url="http://test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/music/artistAlbums"
+        assert set(request.url.params) == {"source", "id", "page"}
+        native_page = int(request.url.params["page"])
+        calls.append(native_page)
+        start = (native_page - 1) * 50
+        return httpx.Response(200, json={"total": 110, "list": [
+            {"id": str(index), "name": f"专辑 {index}"} for index in range(start + 1, min(start + 50, 110) + 1)
+        ]})
+
+    upstream._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
+    monkeypatch.setattr(lxapp, "LXSERVER", upstream)
+    response = test_app_client.get("/api/v1/catalog/artist/albums", params={
+        "source": "tx", "id": "700", "page": page, "limit": size,
+    })
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert calls == native_pages
+    assert data["total"] == 110
+    assert [int(row["id"]) for row in data["items"]] == list(range(
+        (page - 1) * size + 1, min(page * size, 110) + 1))
 
 
 def test_map_lxserver_song_kuwo():
